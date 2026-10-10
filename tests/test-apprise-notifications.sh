@@ -7,6 +7,8 @@ trap 'rm -rf "$WORK"' EXIT
 cat > "$WORK/apprise.py" <<'PY'
 import os
 import time
+if os.environ.get('APPRISE_MISSING') == '1':
+    raise ImportError('synthetic missing optional dependency')
 class NotifyType:
     WARNING="warning"
     INFO="info"
@@ -107,6 +109,16 @@ UU_JOB_SOURCE=scheduler STATUS_MODEL_SEND_NOTIFICATION "$WORK/status.json" "$WOR
 [[ $(wc -l < "$WORK/sent") -eq 8 ]]
 ! grep -Eiq '(ntfys|gotifys|token|fixture.example)' "$WORK/insecure"
 
+# Provider URL configuration symlinks are refused without sending credentials.
+chmod 0600 "$WORK/urls"
+mv "$WORK/urls" "$WORK/real-urls"
+ln -s "$WORK/real-urls" "$WORK/urls"
+UU_JOB_SOURCE=scheduler STATUS_MODEL_SEND_NOTIFICATION "$WORK/status.json" "$WORK/update.conf" 2>"$WORK/url-link-error"
+[[ $(wc -l < "$WORK/sent") -eq 8 ]]
+! grep -Eiq '(ntfys|gotifys|token|fixture.example)' "$WORK/url-link-error"
+rm "$WORK/urls"
+mv "$WORK/real-urls" "$WORK/urls"
+
 # Disabled transport leaves native email alone (verified by separate existing test).
 unset UU_APPRISE_URLS_FILE
 UU_JOB_SOURCE=scheduler STATUS_MODEL_SEND_NOTIFICATION "$WORK/status.json" "$WORK/update.conf"
@@ -163,6 +175,19 @@ with tempfile.TemporaryDirectory() as d:
  assert len(selected)==1 and selected[0]['id']=='external:site-a' and selected[0]['reboot'] is True
 print('Apprise provider timeout, dedupe retention, state safety, External and URL special characters: PASS')
 PY
+
+# Missing optional Apprise does not fail normal checks and never advances delivery state.
+export UU_APPRISE_STATE_FILE="$WORK/missing-dependency.json"
+python3 - "$WORK/status.json" <<'PY'
+import json,sys
+p=sys.argv[1];d=json.load(open(p));d['targets'][0]['updates']['available']=6;json.dump(d,open(p,'w'))
+PY
+before=$(wc -l < "$WORK/sent")
+APPRISE_MISSING=1 UU_JOB_SOURCE=scheduler STATUS_MODEL_SEND_NOTIFICATION "$WORK/status.json" "$WORK/update.conf" 2>"$WORK/missing-apprise-error"
+[[ $(wc -l < "$WORK/sent") -eq "$before" ]]
+! grep -Eiq '(ntfys|gotifys|token|fixture.example)' "$WORK/missing-apprise-error"
+UU_JOB_SOURCE=scheduler STATUS_MODEL_SEND_NOTIFICATION "$WORK/status.json" "$WORK/update.conf"
+[[ $(wc -l < "$WORK/sent") -eq $((before + 2)) ]]
 
 # Concurrent identical event processing has a shared state lock; send once per provider.
 export UU_APPRISE_STATE_FILE="$WORK/concurrent.json"
