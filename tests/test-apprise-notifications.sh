@@ -164,4 +164,31 @@ with tempfile.TemporaryDirectory() as d:
 print('Apprise provider timeout, dedupe retention, state safety, External and URL special characters: PASS')
 PY
 
+# Concurrent identical event processing has a shared state lock; send once per provider.
+export UU_APPRISE_STATE_FILE="$WORK/concurrent.json"
+before=$(wc -l < "$WORK/sent")
+printf 'synthetic update notification\n' | python3 "$ROOT/notification-apprise.py" check "$WORK/status.json" updates &
+first=$!
+printf 'synthetic update notification\n' | python3 "$ROOT/notification-apprise.py" check "$WORK/status.json" updates &
+second=$!
+wait "$first"
+wait "$second"
+[[ $(wc -l < "$WORK/sent") -eq $((before + 2)) ]]
+
+# Native mail and Apprise remain independent: a scheduled update alert may use both.
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/mail" <<'EMAIL_FAKE'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'mail-invoked\n' >> "$EMAIL_CAPTURE"
+EMAIL_FAKE
+chmod 0755 "$WORK/bin/mail"
+export PATH="$WORK/bin:$PATH" EMAIL_CAPTURE="$WORK/mail-events"
+sed -i 's/EMAIL_DAILY_CHECK="false"/EMAIL_DAILY_CHECK="true"/' "$WORK/update.conf"
+export UU_APPRISE_STATE_FILE="$WORK/mail-and-apprise.json"
+before=$(wc -l < "$WORK/sent")
+UU_JOB_SOURCE=scheduler STATUS_MODEL_SEND_NOTIFICATION "$WORK/status.json" "$WORK/update.conf"
+[[ $(wc -l < "$WORK/sent") -eq $((before + 2)) ]]
+[[ $(wc -l < "$WORK/mail-events") -eq 1 ]]
+
 echo "Apprise notification integration tests: PASS"
