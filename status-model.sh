@@ -1031,6 +1031,8 @@ PY
 # a completed check or update into a failure because a notification failed.
 STATUS_MODEL_SEND_APPRISE() {
   local kind="$1" status_file="$2" state="$3" body="$4" run_started_at="${5:-}"
+  # Cluster remote handoff is a worker, not a second notification authority.
+  [[ "${UU_REMOTE_NODE_HANDOFF:-false}" == true ]] && return 0
   [[ -n "${UU_APPRISE_URLS_FILE:-}" ]] || return 0
   local helper="${UU_APPRISE_HELPER:-$(dirname -- "${BASH_SOURCE[0]}")/notification-apprise.py}"
   local interpreter="${UU_APPRISE_PYTHON:-python3}"

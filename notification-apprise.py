@@ -12,10 +12,16 @@ import logging
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 
 STATE_DEFAULT = "/var/lib/ultimate-updater/apprise-notification-state.json"
+DELIVERY_TIMEOUT_SECONDS = 15
+DELIVERY_BUDGET_SECONDS = 20
+STATE_RETENTION_SECONDS = 30 * 86400
+MAX_STATE_ENTRIES = 1024
 
 
 def protected_lines(path):
@@ -87,19 +93,69 @@ def atomic_save(path, data):
             tmp_path.unlink()
 
 
-def deliver(urls, title, message, state):
-    import apprise  # optional runtime dependency; not imported when disabled
-    logging.disable(logging.CRITICAL)
-    client = apprise.Apprise()
-    for url in urls:
-        if not client.add(url):
-            return False
-    notify_type = {
-        "issues": apprise.NotifyType.WARNING,
-        "updates": apprise.NotifyType.INFO,
-        "current": apprise.NotifyType.SUCCESS,
-    }.get(state, apprise.NotifyType.INFO)
-    return bool(client.notify(body=message, title=title, notify_type=notify_type))
+def deliver_one(url, title, message, state, timeout_seconds=None):
+    """Process-isolate a provider, so a hung plugin cannot stall an update job."""
+    request = json.dumps({"url": url, "title": title, "message": message, "state": state})
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--send-single"],
+            input=request, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=DELIVERY_TIMEOUT_SECONDS if timeout_seconds is None else min(DELIVERY_TIMEOUT_SECONDS, timeout_seconds), check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def send_single():
+    """Provider URL arrives on a private pipe, never argv, logs or source."""
+    try:
+        request = json.load(sys.stdin)
+        import apprise  # optional runtime dependency; not imported when disabled
+        logging.disable(logging.CRITICAL)
+        client = apprise.Apprise()
+        if not client.add(request["url"]):
+            return 69
+        notify_type = {
+            "issues": apprise.NotifyType.WARNING,
+            "updates": apprise.NotifyType.INFO,
+            "current": apprise.NotifyType.SUCCESS,
+        }.get(request["state"], apprise.NotifyType.INFO)
+        return 0 if client.notify(body=request["message"], title=request["title"], notify_type=notify_type) else 69
+    except (OSError, ValueError, TypeError, KeyError, ImportError, RuntimeError):
+        return 69
+
+
+def read_delivery_state(path):
+    """Handle corrupted JSON by discarding stale dedupe, never disabling alerts."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}
+    try:
+        meta = os.fstat(descriptor)
+        if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.geteuid()
+                or meta.st_mode & 0o077 or meta.st_size > 1024 * 1024):
+            raise ValueError("unsafe delivery state")
+        with os.fdopen(descriptor, encoding="utf-8", closefd=False) as source:
+            try:
+                state_data = json.load(source)
+            except (json.JSONDecodeError, UnicodeError):
+                state_data = {}
+    finally:
+        os.close(descriptor)
+    return state_data if isinstance(state_data, dict) else {}
+
+
+def prune_delivery_state(state_data, now):
+    """Retain only bounded, recent delivery identities, no provider URLs."""
+    valid = {
+        key: value for key, value in state_data.items()
+        if isinstance(key, str) and isinstance(value, dict)
+        and isinstance(value.get("updated_at"), (int, float))
+        and 0 <= now - value["updated_at"] <= STATE_RETENTION_SECONDS
+    }
+    return dict(sorted(valid.items(), key=lambda item: item[1]["updated_at"], reverse=True)[:MAX_STATE_ENTRIES])
 
 
 def main(argv=None):
@@ -142,28 +198,49 @@ def main(argv=None):
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            if state_file.exists():
-                with state_file.open(encoding="utf-8") as source:
-                    state_data = json.load(source)
-                if not isinstance(state_data, dict):
-                    raise ValueError("invalid delivery state")
-            else:
-                state_data = {}
-            previous = state_data.get(key)
-            if previous and previous.get("fingerprint") == fingerprint:
+            now = time.time()
+            raw_state = read_delivery_state(state_file)
+            previous = raw_state.get(key)
+            if not isinstance(previous, dict):
+                previous = None
+            state_data = prune_delivery_state(raw_state, now)
+            # Already accepted old-format states represent completed delivery.
+            if previous and previous.get("fingerprint") == fingerprint and "delivered_providers" not in previous:
                 return 0
-            # Do not send an initial "all clear"; do report recovery transitions.
+            entry = state_data.get(key) if previous and previous.get("fingerprint") == fingerprint else None
+            if entry is None:
+                entry = {"fingerprint": fingerprint, "state": args.state,
+                         "delivered_providers": [], "updated_at": now}
+            # Do not send an initial all-clear; do report recovery transitions.
             if args.kind == "check" and args.state == "current" and (
-                not previous or previous.get("state") == "current"
+                not previous or (previous.get("state") == "current"
+                                 and previous.get("fingerprint") != fingerprint)
             ):
-                state_data[key] = {"fingerprint": fingerprint, "state": args.state}
+                entry["delivered_providers"] = [hashlib.sha256(url.encode()).hexdigest() for url in urls]
+                entry["updated_at"] = now
+                state_data[key] = entry
                 atomic_save(state_file, state_data)
                 return 0
-            if not deliver(urls, "Ultimate Updater " + args.kind, body, args.state):
+            delivered = set(entry.get("delivered_providers", []))
+            failed = False
+            deadline = time.monotonic() + DELIVERY_BUDGET_SECONDS
+            for url in urls:
+                provider_id = hashlib.sha256(url.encode()).hexdigest()
+                if provider_id in delivered:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining > 0 and deliver_one(url, "Ultimate Updater " + args.kind,
+                                                 body, args.state, timeout_seconds=remaining):
+                    delivered.add(provider_id)
+                    entry["delivered_providers"] = sorted(delivered)
+                    entry["updated_at"] = now
+                    state_data[key] = entry
+                    atomic_save(state_file, state_data)
+                else:
+                    failed = True
+            if failed:
                 print("Apprise delivery failed.", file=sys.stderr)
                 return 69
-            state_data[key] = {"fingerprint": fingerprint, "state": args.state}
-            atomic_save(state_file, state_data)
             return 0
         finally:
             os.close(lock_fd)
@@ -174,4 +251,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--send-single":
+        raise SystemExit(send_single())
     raise SystemExit(main())

@@ -46,10 +46,18 @@ fingerprints. An initial clean check does not produce a noisy alert;
 changed updates/issues and recovery transitions are delivered once.
 Manual update notifications track run start identity to permit distinct runs.
 
-Provider delivery failure does not advance the delivered fingerprint and
-does not change a successful check/update into an update failure. The
-caller receives a generic error without echoing provider URL or credentials.
-Failed notifications are retried on the next eligible event.
+Each provider is delivered independently. Successful destinations are saved by
+an irreversible provider-URL hash, so retrying one failed destination never
+re-sends an already successful destination for the same event. A provider has a
+15-second timeout and all destinations in one event share a 20-second delivery
+budget. On timeout or failure, any remaining undelivered destinations are
+retried on the next eligible event, while the successful check/update remains
+successful. URLs and delivery exceptions are never logged or stored in state.
+
+Corrupt delivery-state JSON resets deduplication so notifications resume. Unsafe
+state file ownership, symlinks or permissions fail closed; protect the parent
+directory and state file as root-only. State entries expire after 30 days and
+the persisted map is capped at 1,024 identities.
 
 Disabling is reversible by unsetting `UU_APPRISE_URLS_FILE`.
 
@@ -67,6 +75,6 @@ during any eventual cutover.
 `bash tests/test-apprise-notifications.sh` uses a fake Apprise module and
 an isolated interpreter wrapper. `bash tests/test-notification-unit-env.sh`
 checks safe and unsafe EnvironmentFile ownership, mode and symlink cases.
-never sends to external destinations. Existing
+These tests use synthetic providers and never send to external destinations. Existing
 `bash tests/test-scheduled-check-notification.sh` and
 `bash tests/test-mail-renderer.sh` verify email compatibility.
